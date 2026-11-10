@@ -9,7 +9,7 @@ on:
     inputs:
       seconds:
         description: 'How long to let each VM run'
-        default: '240'
+        default: '120'
   push:
     paths: ['.github/workflows/kvm-boot.yml']
 
@@ -43,7 +43,7 @@ jobs:
       matrix:
         accel: [kvm, tcg]
     env:
-      SECONDS_TO_RUN: ${{ inputs.seconds || '240' }}
+      SECONDS_TO_RUN: ${{ inputs.seconds || '120' }}
     steps:
       - name: Install QEMU
         run: |
@@ -96,18 +96,31 @@ jobs:
             if [ -z "$banner" ] && grep -qF 'Haiku revision:' out/serial.log 2>/dev/null; then
               banner=$t
             fi
-            if [ $(( t % 15 )) -eq 0 ]; then
+            if [ $(( t % 2 )) -eq 0 ] && [ ! -e "out/shot-$(printf %03d "$t").ppm" ]; then
               echo "screendump out/shot-$(printf %03d "$t").ppm" | socat - UNIX-CONNECT:mon.sock >/dev/null || true
             fi
             kill -0 "$qemu" 2>/dev/null || { echo "::error::QEMU exited after ${t}s"; break; }
-            sleep 1
+            sleep 0.5
           done
           kill "$qemu" 2>/dev/null || true
           sleep 1
-          for p in out/*.ppm; do convert "$p" "${p%.ppm}.png" && rm "$p"; done
+          # The desktop is up from the first screenshot that matches the final one.
+          last=$(ls out/shot-*.ppm | tail -1)
+          desktop=never
+          for p in out/shot-*.ppm; do
+            if [ "$(compare -metric AE "$p" "$last" null: 2>&1 | cut -d' ' -f1)" = 0 ]; then
+              desktop=$(basename "$p" .ppm | sed 's/shot-0*//'); break
+            fi
+          done
+          for p in out/*.ppm; do
+            n=$(basename "$p" .ppm | sed 's/shot-0*//')
+            [ $(( ${n:-0} % 10 )) -eq 0 ] && convert "$p" "${p%.ppm}.png"
+            rm "$p"
+          done
           {
             echo "## ${{ matrix.accel }}"
             echo "- kernel banner after: ${banner:-never} s"
+            echo "- screen final (desktop up) from: ${desktop} s (2 s resolution)"
             echo "- serial log lines in ${SECONDS_TO_RUN}s: $(wc -l < out/serial.log)"
             echo "- last serial line: \`$(tail -1 out/serial.log | tr -d '\`' | cut -c1-120)\`"
           } | tee -a "$GITHUB_STEP_SUMMARY"

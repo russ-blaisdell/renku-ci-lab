@@ -10,7 +10,14 @@ nightly (x86_64) twice, once with KVM and once with TCG, and records:
 
 - the runner's CPU, memory and whether `/dev/kvm` exists;
 - seconds until the kernel banner (`Haiku revision:`);
-- the serial log, plus a screenshot every 15 seconds (to see when the desktop appears).
+- seconds until the screen stops changing, i.e. the desktop (Welcome window) is up, from screenshots every 2 seconds;
+- the serial log, plus a screenshot every 10 seconds.
+
+## Results
+
+- 2026-11-10, run 42864677268 (nightly build00078, 4-vCPU AMD EPYC runner): `/dev/kvm` exists and works after the
+  udev rule (the guest sees `x2apic`, which QEMU only offers under KVM). Desktop up within 15 s with KVM, between 15
+  and 30 s with TCG.
 
 Run it from the Actions tab ("kvm-boot", Run workflow). It also runs when the workflow file changes. Results are in
 the run summary and the `boot-kvm` / `boot-tcg` artifacts.
