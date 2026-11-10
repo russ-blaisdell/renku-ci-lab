@@ -1,0 +1,154 @@
+# How much does KVM speed up CPU-heavy guest work (the planned smoke test and
+# stress runs), compared with TCG? Puts workload/UserBootscript into the
+# RenkuOS nightly image, boots it both ways, presses Enter on the first-boot
+# prompt ("Try it out") and records the timings the script reports on the
+# second serial port.
+name: workload
+
+on:
+  workflow_dispatch:
+  push:
+    paths:
+      - '.github/workflows/workload.yml'
+      - 'workload/**'
+
+permissions:
+  contents: read
+
+env:
+  TOOLCHAIN: ghcr.io/renkuos/cross-compiler:x86_64-master
+
+jobs:
+  bfs-shell:
+    name: build bfs_shell
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+    steps:
+      - name: Build the host tool in the RenkuOS toolchain container
+        run: |
+          docker pull --quiet "$TOOLCHAIN"
+          git clone -q --depth 1 https://github.com/RenkuOS/Source.git src
+          docker run --rm -v "$PWD:/w" -w /w/src -e HOME=/tmp "$TOOLCHAIN" bash -euo pipefail -c '
+            git config --global --add safe.directory /w/src
+            mkdir -p generated && cd generated
+            ../configure --host-only
+            jam -q -j"$(nproc)" "<build>bfs_shell"
+            tool=$(find . -name bfs_shell -type f -perm -u+x | head -1)
+            echo "built: $tool"; ldd "$tool" || true
+            cp "$tool" /w/bfs_shell
+          '
+      - uses: actions/upload-artifact@v4
+        with:
+          name: bfs_shell
+          path: bfs_shell
+
+  run:
+    name: workload ${{ matrix.accel }}
+    needs: bfs-shell
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
+    strategy:
+      fail-fast: false
+      matrix:
+        accel: [kvm, tcg]
+    env:
+      LIMIT: 1500
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/download-artifact@v4
+        with:
+          name: bfs_shell
+
+      - name: Install QEMU
+        run: |
+          sudo apt-get update -qq
+          sudo apt-get install -y -qq qemu-system-x86 socat imagemagick
+
+      - name: Enable KVM for the runner user
+        if: matrix.accel == 'kvm'
+        run: |
+          echo 'KERNEL=="kvm", GROUP="kvm", MODE="0666", OPTIONS+="static_node=kvm"' \
+            | sudo tee /etc/udev/rules.d/99-kvm4all.rules
+          sudo udevadm control --reload-rules
+          sudo udevadm trigger --name-match=kvm
+
+      - name: Download the RenkuOS nightly (x86_64)
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          mkdir img
+          gh release download nightly --repo RenkuOS/Source --pattern '*x86_64*.iso' --dir img
+          echo "IMAGE=$(ls "$PWD"/img/*.iso | head -1)" >> "$GITHUB_ENV"
+
+      - name: Put the workload script into the image
+        run: |
+          sfdisk -d "$IMAGE" || true
+          start=$(sfdisk -J "$IMAGE" | jq -r '.partitiontable.partitions[] | select(.type == "eb") | .start' | head -1)
+          [ -n "$start" ] || { echo "::error::no BFS (0xeb) partition in the image"; exit 1; }
+          offset=$(( start * 512 ))
+          echo "BFS partition at byte $offset"
+          chmod +x bfs_shell
+          printf '%s\n' \
+            'mkdir -p /myfs/home/config/settings/boot' \
+            'cp -f :/w/workload/UserBootscript /myfs/home/config/settings/boot/UserBootscript' \
+            'cat /myfs/home/config/settings/boot/UserBootscript' \
+            'sync' \
+            'quit' > cmds
+          docker run --rm -i -v "$PWD:/w" -v "$(dirname "$IMAGE"):/img" "$TOOLCHAIN" \
+            /w/bfs_shell --start-offset "$offset" "/img/$(basename "$IMAGE")" < cmds | tail -5
+
+      - name: Boot and run the workload
+        run: |
+          mkdir out
+          accel=${{ matrix.accel }}
+          [ "$accel" = tcg ] && accel="tcg,thread=multi"
+          : > out/com2.log
+          qemu-system-x86_64 -machine pc -accel "$accel" -smp "$(nproc)" -m 2048 \
+            -drive file="$IMAGE",format=raw \
+            -serial file:out/serial.log -serial file:out/com2.log \
+            -display none -vga std -monitor unix:mon.sock,server,nowait &
+          qemu=$!
+          tail -F out/com2.log 2>/dev/null | while IFS= read -r line; do
+            echo "$(date +%s.%N | cut -c1-14) $line"
+          done > out/com2.stamped &
+          start=$(date +%s)
+          mon() { echo "$1" | socat - UNIX-CONNECT:mon.sock >/dev/null 2>&1 || true; }
+          while [ $(( $(date +%s) - start )) -lt "$LIMIT" ]; do
+            t=$(( $(date +%s) - start ))
+            # Press Enter on the first-boot prompt until the script starts.
+            if ! grep -q 'WL start' out/com2.log && [ $(( t % 5 )) -eq 0 ] && [ "$t" -gt 5 ]; then
+              mon "sendkey ret"
+            fi
+            [ $(( t % 30 )) -eq 0 ] && mon "screendump out/shot-$(printf %04d "$t").ppm"
+            grep -q 'WL done' out/com2.log && break
+            kill -0 "$qemu" 2>/dev/null || { echo "::error::QEMU exited after ${t}s"; break; }
+            sleep 1
+          done
+          elapsed=$(( $(date +%s) - start ))
+          mon "screendump out/shot-final.ppm"; sleep 2
+          kill "$qemu" 2>/dev/null || true
+          for p in out/*.ppm; do convert "$p" "${p%.ppm}.png" && rm "$p"; done
+          first=$(grep -m1 'WL start' out/com2.stamped | cut -d' ' -f1)
+          last=$(grep -m1 'WL done' out/com2.stamped | cut -d' ' -f1)
+          {
+            echo "## ${{ matrix.accel }}"
+            echo "- finished: $(grep -q 'WL done' out/com2.log && echo yes || echo "no (stopped at ${elapsed}s)")"
+            [ -n "$first" ] && [ -n "$last" ] && echo "- workload wall time (host clock): $(echo "$last - $first" | bc) s"
+            echo '```'
+            grep -v '^WL app ' out/com2.log || true
+            echo '```'
+            echo "<details><summary>apps</summary>"
+            echo
+            echo '```'
+            grep '^WL app ' out/com2.log || true
+            echo '```'
+            echo "</details>"
+          } | tee -a "$GITHUB_STEP_SUMMARY"
+          grep -q 'WL done' out/com2.log
+
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: workload-${{ matrix.accel }}
+          path: out/
