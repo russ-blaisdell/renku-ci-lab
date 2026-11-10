@@ -1,0 +1,119 @@
+# Does /dev/kvm work on GitHub's free hosted runners, and how much faster does
+# a RenkuOS nightly boot with it than with TCG (software emulation)?
+# Boots the published nightly image both ways and records timings, the serial
+# log and a screenshot every 15 seconds.
+name: kvm-boot
+
+on:
+  workflow_dispatch:
+    inputs:
+      seconds:
+        description: 'How long to let each VM run'
+        default: '240'
+  push:
+    paths: ['.github/workflows/kvm-boot.yml']
+
+permissions:
+  contents: read
+
+jobs:
+  probe:
+    name: probe runner
+    runs-on: ubuntu-latest
+    steps:
+      - name: CPU and KVM
+        run: |
+          {
+            echo "## Runner"
+            echo '```'
+            nproc; free -h | head -2
+            grep -m1 'model name' /proc/cpuinfo
+            echo "vmx/svm flags: $(grep -cE 'vmx|svm' /proc/cpuinfo)"
+            ls -l /dev/kvm 2>&1 || true
+            echo '```'
+          } | tee -a "$GITHUB_STEP_SUMMARY"
+
+  boot:
+    name: boot ${{ matrix.accel }}
+    needs: probe
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    strategy:
+      fail-fast: false
+      matrix:
+        accel: [kvm, tcg]
+    env:
+      SECONDS_TO_RUN: ${{ inputs.seconds || '240' }}
+    steps:
+      - name: Install QEMU
+        run: |
+          sudo apt-get update -qq
+          sudo apt-get install -y -qq qemu-system-x86 socat imagemagick
+
+      - name: Enable KVM for the runner user
+        if: matrix.accel == 'kvm'
+        run: |
+          echo 'KERNEL=="kvm", GROUP="kvm", MODE="0666", OPTIONS+="static_node=kvm"' \
+            | sudo tee /etc/udev/rules.d/99-kvm4all.rules
+          sudo udevadm control --reload-rules
+          sudo udevadm trigger --name-match=kvm
+          ls -l /dev/kvm
+
+      - name: Download the RenkuOS nightly (x86_64)
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          mkdir img && cd img
+          gh release view nightly --repo RenkuOS/Source --json assets --jq '.assets[].name'
+          gh release download nightly --repo RenkuOS/Source --pattern '*x86_64*'
+          ls -l
+          for f in *; do
+            case "$f" in
+              *.zip) unzip -q "$f" && rm "$f" ;;
+              *.xz) xz -d "$f" ;;
+              *.zst) zstd -d --rm "$f" ;;
+              *.gz) gunzip "$f" ;;
+            esac
+          done
+          image=$(ls -S | grep -viE 'sha|sum|txt' | head -1)
+          echo "IMAGE=$PWD/$image" >> "$GITHUB_ENV"
+          ls -l
+
+      - name: Boot and measure
+        run: |
+          mkdir out
+          accel=${{ matrix.accel }}
+          [ "$accel" = tcg ] && accel="tcg,thread=multi"
+          qemu-system-x86_64 -machine pc -accel "$accel" -smp "$(nproc)" -m 2048 \
+            -drive file="$IMAGE",format=raw,snapshot=on \
+            -serial file:out/serial.log -display none -vga std \
+            -monitor unix:mon.sock,server,nowait &
+          qemu=$!
+          start=$(date +%s)
+          banner=""
+          while [ $(( $(date +%s) - start )) -lt "$SECONDS_TO_RUN" ]; do
+            t=$(( $(date +%s) - start ))
+            if [ -z "$banner" ] && grep -qF 'Haiku revision:' out/serial.log 2>/dev/null; then
+              banner=$t
+            fi
+            if [ $(( t % 15 )) -eq 0 ]; then
+              echo "screendump out/shot-$(printf %03d "$t").ppm" | socat - UNIX-CONNECT:mon.sock >/dev/null || true
+            fi
+            kill -0 "$qemu" 2>/dev/null || { echo "::error::QEMU exited after ${t}s"; break; }
+            sleep 1
+          done
+          kill "$qemu" 2>/dev/null || true
+          sleep 1
+          for p in out/*.ppm; do convert "$p" "${p%.ppm}.png" && rm "$p"; done
+          {
+            echo "## ${{ matrix.accel }}"
+            echo "- kernel banner after: ${banner:-never} s"
+            echo "- serial log lines in ${SECONDS_TO_RUN}s: $(wc -l < out/serial.log)"
+            echo "- last serial line: \`$(tail -1 out/serial.log | tr -d '\`' | cut -c1-120)\`"
+          } | tee -a "$GITHUB_STEP_SUMMARY"
+
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: boot-${{ matrix.accel }}
+          path: out/
