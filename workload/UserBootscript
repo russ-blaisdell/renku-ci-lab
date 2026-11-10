@@ -50,7 +50,13 @@ for app in /boot/system/apps/* /boot/system/preferences/*; do
 	result=timeout
 	while [ $(( $(now_ms) - start )) -lt 20000 ]; do
 		if ! kill -0 "$pid" 2>/dev/null; then result=exited; break; fi
-		count=$(run_for 5 hey "$sig" count Window 2>/dev/null | sed -n 's/.*result: *\([0-9][0-9]*\).*/\1/p')
+		# hey replies with a line like: "result" (B_INT32_TYPE) : 1 (0x00000001)
+		reply=$(run_for 5 hey "$sig" count Window 2>&1)
+		if [ -z "$shown_reply" ] && [ -n "$reply" ]; then
+			report "hey_reply_sample $(echo "$reply" | tr '\n' '|' | cut -c1-200)"
+			shown_reply=1
+		fi
+		count=$(echo "$reply" | sed -n 's/.*"result"[^:]*: *\([0-9][0-9]*\).*/\1/p')
 		if [ -n "$count" ] && [ "$count" -ge 1 ]; then result=window; break; fi
 		sleep 0.2
 	done
